@@ -1,0 +1,6 @@
+pytest>=8
+streamlit>=1.57,<2
+# AI-assisted bug report analysis (Groq by default, via the OpenAI-compatible
+# SDK). Only used when GROQ_API_KEY is set; the app and all tests run fine
+# without it.
+openai>=1.59,<2
