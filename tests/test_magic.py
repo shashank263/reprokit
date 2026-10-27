@@ -17,8 +17,16 @@ from reprokit import magic
         ("index.TSX", "code"),
         ("main.go", "code"),
         ("server.log", "log"),
+        ("main.cpp", "code"),
+        ("module.rs", "code"),
+        ("deploy.sh", "code"),
         ("notes.txt", "text"),
         ("config.yaml", "text"),
+        ("settings.toml", "text"),
+        ("page.html", "text"),
+        ("style.css", "text"),
+        ("query.sql", "code"),
+        ("trace.out", "log"),
     ],
 )
 def test_classify_extension(name, kind):
@@ -86,11 +94,32 @@ def test_path_components_are_stripped():
 
 
 def test_binary_and_non_utf8_are_flagged_not_crashing():
-    [binary] = magic.ingest_files([("blob.py", b"a\x00b")])
-    assert any("Binary" in w for w in binary.warnings)
+    with pytest.raises(magic.BinaryFileError, match="was not analyzed"):
+        magic.ingest_files([("blob.py", b"a\x00b")])
+    with pytest.raises(magic.BinaryFileError, match="binary control bytes"):
+        magic.ingest_files([("image.txt", b"\x89PNG\x01\x02\x03\x04")])
 
     [latin] = magic.ingest_files([("notes.txt", b"caf\xe9")])
     assert any("UTF-8" in w for w in latin.warnings)
+
+
+def test_unsupported_content_is_identified_without_decoding():
+    with pytest.raises(magic.UnsupportedFileTypeError, match="unsupported extension"):
+        magic.ingest_files([("photo.png", b"\x89PNG\r\n\x1a\n")])
+
+
+@pytest.mark.parametrize("extension", sorted(magic.CODE_EXTENSIONS))
+def test_all_supported_source_extensions_are_classified(extension):
+    assert magic.classify_extension(f"sample{extension}") == "code"
+    [item] = magic.ingest_files([(f"sample{extension}", b"content\n")])
+    assert item.format != "plain text"
+
+
+@pytest.mark.parametrize("extension", sorted(magic.TEXT_EXTENSIONS))
+def test_all_supported_document_and_configuration_extensions_are_classified(extension):
+    assert magic.classify_extension(f"sample{extension}") == "text"
+    [item] = magic.ingest_files([(f"sample{extension}", b"content\n")])
+    assert item.format != "plain text" or extension == ".txt"
 
 
 # ---------------------------------------------------------------------------
@@ -163,12 +192,12 @@ def test_duplicate_question_id_rejected():
 # ---------------------------------------------------------------------------
 def test_workflow_steps_are_ordered_and_validated():
     keys = [key for key, _ in magic.WORKFLOW_STEPS]
-    assert keys == ["upload", "group", "questions", "proposal", "verify"]
+    assert keys == ["upload", "analyze", "evidence", "proposal", "verify"]
 
     session = magic.MagicSession()
     assert session.step == "upload"
-    session.set_step("questions")
-    assert session.step == "questions"
+    session.set_step("evidence")
+    assert session.step == "evidence"
     with pytest.raises(magic.MagicInputError):
         session.set_step("deploy")
 
@@ -231,6 +260,11 @@ def test_resolve_evidence_respects_max_refs():
     files = magic.ingest_files([("app.py", b"1\n2\n3\n4\n5\n6\n")])
     resolved = magic.resolve_evidence(files, [("app.py", n) for n in range(1, 7)], max_refs=2)
     assert len(resolved) == 2
+
+
+def test_resolve_evidence_zero_limit_returns_no_evidence():
+    files = magic.ingest_files([("app.py", b"line\n")])
+    assert magic.resolve_evidence(files, [("app.py", 1)], max_refs=0) == []
 
 
 def _ai_issue(title="Bug", refs=None, severity="high", hypothesis="Likely caused by X", questions=("Q1?",)):
@@ -317,7 +351,7 @@ def test_set_issues_registers_questions_and_moves_step():
     session.set_issues(issues)
 
     assert session.selected_issue_id == issues[0].id
-    assert session.step == "questions"
+    assert session.step == "evidence"
     assert session.questions_for(issues[0].id) == issues[0].questions
 
 
@@ -337,6 +371,119 @@ def test_issue_evidence_display_is_redacted():
     [issue] = magic.issues_from_ai([_ai_issue(refs=[("app.py", 1)])], files)
     assert "supersecret123" not in issue.evidence[0].display_text
     assert "REDACTED" in issue.evidence[0].display_text
+
+
+@pytest.mark.parametrize(
+    ("name", "source", "expected"),
+    [
+        ("broken.py", b"def f(:\n    pass\n", "Python syntax error"),
+        ("broken.json", b'{"ok": }\n', "Malformed JSON"),
+        ("broken.xml", b"<root>\n<item>\n", "Malformed XML"),
+    ],
+)
+def test_static_syntax_errors_have_exact_grounded_lines(name, source, expected):
+    files = magic.ingest_files([(name, source)])
+    issues, _notes = magic.analyze_static(files)
+
+    [issue] = issues
+    assert expected in issue.title
+    assert issue.severity == "high"
+    assert issue.confidence == 1.0
+    assert issue.verification_status == "failed"
+    assert issue.evidence
+    assert issue.evidence[0].file == name
+    assert 1 <= issue.evidence[0].line <= files[0].line_count
+
+
+def test_static_checks_support_json_toml_xml_and_report_unknown_validators():
+    files = magic.ingest_files(
+        [
+            ("settings.json", b'{"enabled": true}\n'),
+            ("settings.toml", b"[app]\nenabled = true\n"),
+            ("settings.ini", b"[app]\nenabled = true\n"),
+            ("settings.xml", b"<app><enabled>true</enabled></app>\n"),
+            ("script.js", b"function run() { return 1; }\n"),
+        ]
+    )
+    issues, notes = magic.analyze_static(files)
+    assert issues == []
+    assert any("JSON syntax validation passed" in note for note in notes)
+    if magic.tomllib is None:
+        assert any("settings.toml" in note and "no installed" in note for note in notes)
+    else:
+        assert any("TOML syntax validation passed" in note for note in notes)
+    assert any("XML syntax validation passed" in note for note in notes)
+    assert any("INI syntax validation passed" in note for note in notes)
+    assert any("no installed static validator" in note for note in notes)
+
+
+def test_multiple_unrelated_files_are_reported_independently():
+    files = magic.ingest_files(
+        [
+            ("input.py", b"def valid(value):\n    return len(value) > 0\n"),
+            ("unrelated.js", b"function run() { return 1; }\n"),
+        ]
+    )
+    issues, notes = magic.analyze_static(files)
+
+    assert len(issues) == 1
+    assert {item.file for item in issues[0].evidence} == {"input.py"}
+    assert any("unrelated.js" in note for note in notes)
+    assert not any("unrelated.js" in item.file for item in issues[0].evidence)
+
+
+def test_static_analysis_parses_but_never_executes_uploaded_python():
+    files = magic.ingest_files(
+        [("do_not_run.py", b"raise RuntimeError('must not execute')\n")]
+    )
+
+    issues, _notes = magic.analyze_static(files)
+
+    assert issues == []
+    assert files[0].text.startswith("raise RuntimeError")
+
+
+def test_logic_issue_proposes_narrow_fix_with_explicit_assumption():
+    files = magic.ingest_files(
+        [("input.py", b"def is_valid(value):\n    return len(value) > 0\n")]
+    )
+    [issue], _notes = magic.analyze_static(files)
+
+    assert "Whitespace-only" in issue.title
+    assert issue.evidence[0].label == "input.py:2"
+    assert issue.confidence == 0.78
+    assert issue.verification_status == "inconclusive"
+    assert issue.assumptions
+    from reprokit import patch, studio
+
+    validation = patch.validate_diff(issue.fix_diff, {files[0].name: files[0].text})
+    assert validation.ok, validation.error
+    [corrected], error = studio.generate_corrected_files(files, validation)
+    assert error == ""
+    assert "len(value.strip()) > 0" in corrected.corrected
+    assert files[0].text.endswith("return len(value) > 0\n")
+
+
+def test_invalid_ini_reports_exact_parser_line():
+    files = magic.ingest_files([("settings.ini", b"[app]\nenabled = true\ninvalid\n")])
+
+    [issue], _notes = magic.analyze_static(files)
+
+    assert issue.title.startswith("Malformed INI")
+    assert issue.evidence[0].label == "settings.ini:3"
+    assert issue.verification_status == "failed"
+
+
+def test_log_only_upload_is_grounded_and_never_treated_as_source():
+    files = magic.ingest_files([("service.log", b"ERROR database unavailable\n")])
+    issues = magic.issues_from_logs(files)
+
+    [issue] = issues
+    assert issue.category == "log"
+    assert issue.evidence[0].label == "service.log:1"
+    assert issue.observed_problem.startswith("Observed error log event")
+    assert issue.fix_diff == ""
+    assert not [item for item in files if item.kind != "log"]
 
 # ---------------------------------------------------------------------------
 # Stage 3: fix context and staging

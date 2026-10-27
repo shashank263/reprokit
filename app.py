@@ -10,7 +10,7 @@ import tempfile
 
 import streamlit as st
 
-from reprokit import analysis, logs, magic, patch, ui, verify
+from reprokit import analysis, logs, magic, patch, studio, ui, verify
 from reprokit.runner import TestRunResult, run_tests
 
 # Approved identifiers only — see reprokit/runner.py.
@@ -570,7 +570,7 @@ def _render_magic_files(files: list[magic.MagicFile]) -> None:
         with st.container(border=True):
             col_name, col_kind, col_size, col_lines = st.columns([3, 1, 1, 1])
             col_name.markdown(f"`{item.name}`")
-            col_kind.markdown(f"**{item.kind}**")
+            col_kind.markdown(f"**{item.format}** · {item.kind}")
             col_size.caption(f"{item.size_bytes:,} bytes")
             col_lines.caption(f"{item.line_count:,} lines")
             st.caption(f"SHA-256 `{item.sha256[:16]}…` · read-only snapshot")
@@ -581,16 +581,16 @@ def _render_magic_files(files: list[magic.MagicFile]) -> None:
 
 
 def render_magic_mode() -> None:
-    """Magic Mode (Stage 2): grounded issues + private-by-default follow-ups."""
+    """Magic Mode: automatic analysis, grounded fixes, and safe verification."""
     ui.hero(
         "Magic Mode — Assist",
         "Magic Mode",
         "AI-Assisted Issue Review",
-        "Upload code, logs, and notes. Deterministic grouping comes first, every "
-        "finding is grounded in real file lines, and the model asks you targeted "
-        "questions before proposing anything.",
-        chips=("Grounding required", "Private by default", "Nothing executed"),
-        terminal='upload → detect → ask → <span class="rk-ok">propose</span> → verify',
+        "Upload supported source, configuration, logs, or text. ReproKit analyzes "
+        "automatically, grounds findings in real file lines, and proceeds with "
+        "best-effort fixes without requiring follow-up answers.",
+        chips=("Grounding required", "Automatic analysis", "Nothing executed"),
+        terminal='upload → analyze → evidence → <span class="rk-ok">fix</span> → verify',
     )
 
     session = _magic_session()
@@ -600,7 +600,7 @@ def render_magic_mode() -> None:
     ui.section(
         "01 · Intake",
         "1 · Upload files",
-        "Snapshots are read-only, hashed, and never executed.",
+        "Snapshots are read-only and hashed; supported text files are analyzed automatically.",
     )
     st.caption(
         f"Accepted: {', '.join(sorted(magic.ALLOWED_EXTENSIONS))} · "
@@ -610,8 +610,7 @@ def render_magic_mode() -> None:
     )
 
     uploads = st.file_uploader(
-        "Code, log, and text files",
-        type=[ext.lstrip(".") for ext in sorted(magic.ALLOWED_EXTENSIONS)],
+        "Source, configuration, log, and text files",
         accept_multiple_files=True,
         key="magic_upload",
     )
@@ -622,12 +621,15 @@ def render_magic_mode() -> None:
         except magic.MagicInputError as exc:
             st.error(f"Upload rejected: {exc}")
             return
-        if files != session.files:
+        files_changed = files != session.files
+        if files_changed:
             session.files = files
             session.set_issues([])
             session.analysis_note = ""
+            _clear_magic_proposal_state(session)
+            _run_magic_analysis(session)
         if session.step == "upload":
-            session.set_step("group")
+            session.set_step("analyze")
     else:
         files = session.files
 
@@ -641,11 +643,11 @@ def render_magic_mode() -> None:
     ui.section(
         "02 · Grounding",
         "2 · Detected issues",
-        "Every evidence reference is resolved against an uploaded line.",
+        "Analysis runs on upload; findings cite uploaded lines. Follow-up questions are optional.",
     )
     status = analysis.provider_status()
     col_detect, col_status = st.columns([1, 3])
-    if col_detect.button("Detect issues", type="primary", use_container_width=True):
+    if col_detect.button("Re-analyze files", type="primary", use_container_width=True):
         _run_magic_analysis(session)
     if status.available:
         col_status.caption(
@@ -660,9 +662,20 @@ def render_magic_mode() -> None:
 
     if not session.issues:
         st.info(
-            "No issues yet. Click **Detect issues**. Log files are grouped "
-            "deterministically; code and text files are reviewed by AI when a key "
-            "is configured."
+            "No actionable findings were detected. Static checks do not prove "
+            "general logic correctness; AI review is used when configured."
+        )
+        report = studio.build_findings_report(
+            files=session.files,
+            issues=[],
+            notes=session.notes + ([session.analysis_note] if session.analysis_note else []),
+        )
+        st.download_button(
+            "Download findings report (Markdown)",
+            data=report,
+            file_name="reprokit-analysis-report.md",
+            mime="text/markdown",
+            key="download_magic_empty_findings_report",
         )
         _render_magic_privacy(session)
         return
@@ -684,15 +697,53 @@ def render_magic_mode() -> None:
     )
     issue = session.select_issue(selected_id)
 
-    col_sev, col_src, col_ev = st.columns(3)
+    col_sev, col_src, col_ev, col_conf = st.columns(4)
     col_sev.metric("Severity", issue.severity)
     col_src.metric("Severity source", issue.severity_source)
     col_ev.metric("Evidence lines", len(issue.evidence))
+    col_conf.metric("Confidence", f"{issue.confidence:.0%}")
+    st.caption(f"Finding verification status: `{issue.verification_status}`")
 
     st.markdown("**Observed evidence (exact uploaded lines, redacted for display)**")
     st.code(
         "\n".join(f"{item.label}: {item.display_text}" for item in issue.evidence),
         language="text",
+    )
+    if issue.observed_problem:
+        st.markdown("**Observed problem**")
+        st.write(issue.observed_problem)
+    if issue.why_it_matters:
+        st.markdown("**Why it matters**")
+        st.write(issue.why_it_matters)
+    if issue.recommendations:
+        recommendation_heading = (
+            "Actionable next steps (AI suggestions)"
+            if issue.recommendations_source == "ai"
+            else "Remediation guidance (not a confirmed cause)"
+        )
+        st.markdown(f"**{recommendation_heading}**")
+        for recommendation in issue.recommendations:
+            st.write(f"- {recommendation}")
+    if issue.proposed_correction:
+        st.markdown("**Proposed correction**")
+        st.code(issue.proposed_correction, language="text")
+    for assumption in issue.assumptions:
+        st.caption(f"Assumption: {assumption}")
+
+    report = studio.build_findings_report(
+        files=session.files,
+        issues=session.issues,
+        notes=session.notes + ([session.analysis_note] if session.analysis_note else []),
+        proposal=session.fix_proposal,
+        corrected=session.corrected_files,
+        verification=session.verification,
+    )
+    st.download_button(
+        "Download findings report (Markdown)",
+        data=report,
+        file_name="reprokit-analysis-report.md",
+        mime="text/markdown",
+        key="download_magic_findings_report",
     )
 
     if issue.is_ai_hypothesis:
@@ -729,16 +780,21 @@ def render_magic_mode() -> None:
         "Reviewable diff only. Originals stay untouched.",
     )
     st.caption(
-        "The AI proposes a unified diff. It is validated against your exact uploaded "
+        "A proposed unified diff is validated against your exact uploaded "
         "snapshots before anything is shown; nothing is applied to your files. "
         "Uploaded code is **not executed**, and the allowlisted fixture tests cannot "
         "verify arbitrary uploaded projects."
     )
-    if st.button("Propose fix", type="primary", use_container_width=False):
+    if issue.category == "log":
+        st.info(
+            "This finding is based on logs. ReproKit will not invent or modify "
+            "application source that was not directly implicated by evidence."
+        )
+    elif st.button("Propose fix", type="primary", use_container_width=False):
         _run_propose_fix(session, issue)
 
     if session.fix_proposal is not None and session.fix_proposal.issue_id == issue.id:
-        _render_fix_proposal(session, session.fix_proposal)
+        _render_fix_proposal(session, issue, session.fix_proposal)
 
     _render_magic_privacy(session)
 
@@ -747,9 +803,61 @@ def _run_propose_fix(session: magic.MagicSession, issue: magic.Issue) -> None:
     """Request, parse, and validate a fix proposal. Never applies anything."""
     session.fix_proposal = None
     session.verification = None
+    session.regression = None
+    session.corrected_files = []
+    sources = {item.name: item.text for item in session.files if item.kind != "log"}
+    if not sources or not any(
+        evidence.file in sources for evidence in issue.evidence
+    ):
+        session.analysis_note = (
+            "No source or configuration file supports a safe correction. "
+            "Log-only findings receive remediation guidance, not invented source fixes."
+        )
+        return
+
+    if issue.fix_diff:
+        validation = patch.validate_diff(issue.fix_diff, sources)
+        proposal = magic.FixProposal(
+            issue_id=issue.id,
+            explanation=(
+                "Trim surrounding whitespace before testing for an empty value. "
+                "This deterministic correction assumes whitespace-only input is invalid."
+            ),
+            diff=validation.canonical_diff if validation.ok else "",
+            files_changed=[(item.path, [issue.evidence[0].line]) for item in validation.files],
+            expected_behavior="Whitespace-only strings are rejected.",
+            tests_needed=["Check that ordinary text is accepted and whitespace-only text is rejected."],
+            limitations=[
+                "The intended input policy is not established by the source alone.",
+                "Uploaded application code was not executed.",
+            ],
+            validation=validation,
+        )
+        if not validation.ok:
+            proposal.rejection_reason = magic.rejection_reason_for(proposal)
+        session.fix_proposal = proposal
+        session.analysis_note = (
+            "A minimal static correction was validated against the immutable upload. "
+            "Its whitespace-policy assumption is shown with the finding."
+            if validation.ok
+            else f"Static fix rejected: {proposal.rejection_reason}"
+        )
+        if validation.ok:
+            session.set_step("proposal")
+            session.corrected_files, error = studio.generate_corrected_files(
+                session.files, validation, reason=proposal.explanation
+            )
+            if error:
+                session.analysis_note += f" Corrected copy withheld: {error}"
+        return
+
     status = analysis.provider_status()
     if not status.available:
-        session.analysis_note = f"Fix proposal unavailable: {status.reason}"
+        session.analysis_note += (
+            " "
+            f"AI fix proposal unavailable: {status.reason} "
+            "The static finding and its assumptions remain available for review."
+        )
         return
 
     context = magic.build_fix_context(
@@ -763,7 +871,6 @@ def _run_propose_fix(session: magic.MagicSession, issue: magic.Issue) -> None:
         return
 
     draft = result.data
-    sources = {item.name: item.text for item in session.files if item.kind != "log"}
     validation = patch.validate_diff(draft.diff, sources)
     proposal = magic.FixProposal(
         issue_id=issue.id,
@@ -778,6 +885,7 @@ def _run_propose_fix(session: magic.MagicSession, issue: magic.Issue) -> None:
         model=draft.model,
     )
     if validation.ok:
+        session.set_step("proposal")
         session.analysis_note = (
             "Fix proposal validated against your snapshots. It is not verified by tests."
         )
@@ -785,28 +893,37 @@ def _run_propose_fix(session: magic.MagicSession, issue: magic.Issue) -> None:
         proposal.rejection_reason = magic.rejection_reason_for(proposal)
         session.analysis_note = f"Fix proposal rejected: {proposal.rejection_reason}"
     session.fix_proposal = proposal
+    if validation.ok:
+        corrected, error = studio.generate_corrected_files(
+            session.files, validation, reason=proposal.explanation
+        )
+        if not error:
+            session.corrected_files = corrected
+        else:
+            session.analysis_note += f" Corrected copy withheld: {error}"
 
 
-def _render_fix_proposal(session: magic.MagicSession, proposal: magic.FixProposal) -> None:
+def _render_fix_proposal(session: magic.MagicSession, issue, proposal: magic.FixProposal) -> None:
+    """Evidence-to-Fix Review Studio: evidence, fix, test, downloads."""
     report = session.verification
     if report is None:
         st.warning(
-            "**Proposed — not verified.** This diff was generated by AI and validated "
-            "for safety/application only. No tests have run against it, and uploaded "
-            "code is never executed.",
+            "**Proposed - not verified.** This change was validated for "
+            "safety/application only. No tests have run against it, "
+            "and uploaded code is never executed.",
             icon="⚠️",
         )
     elif report.overall_status == verify.STATUS_VERIFIED:
         st.success(
-            "**Statically verified — runtime behavior NOT verified.** Integrity, "
-            "workspace, and syntax checks passed, and ReproKit's own fixtures passed. "
-            "Uploaded code was not executed.",
+            "**Statically verified - runtime behavior NOT verified.** Integrity, "
+            "workspace, and syntax checks passed, and ReproKit's own fixtures "
+            "passed. Uploaded code was not executed.",
             icon="✅",
         )
     elif report.overall_status == verify.STATUS_FAILED:
         st.error(
             "**Verification failed.** One or more approved checks did not pass; "
-            "see the evidence below.",
+            "see the Verification tab.",
             icon="❌",
         )
     else:
@@ -830,6 +947,71 @@ def _render_fix_proposal(session: magic.MagicSession, proposal: magic.FixProposa
         )
         return
 
+    evidence_tab, fix_tab, test_tab, download_tab = st.tabs(
+        ["1 · Evidence", "2 · Fix & verification", "3 · Regression test", "4 · Downloads"]
+    )
+    with evidence_tab:
+        _render_studio_evidence(session, proposal, issue)
+    with fix_tab:
+        _render_studio_fix(session, proposal)
+    with test_tab:
+        _render_studio_regression(session, proposal, issue)
+    with download_tab:
+        _render_studio_downloads(session, proposal, issue)
+
+
+def _render_studio_evidence(session, proposal, issue) -> None:
+    """A. Source files and evidence, linked to real uploaded lines."""
+    if issue is None:
+        st.info("Select an issue to see its evidence.")
+        return
+
+    st.markdown(f"### {issue.title}")
+    st.caption(
+        f"Severity `{issue.severity}` · source `{issue.severity_source}` · "
+        f"category `{issue.category}`"
+    )
+
+    st.markdown("**Observed evidence (exact uploaded lines, redacted)**")
+    if issue.evidence:
+        st.code(
+            "\n".join(f"{item.label}: {item.display_text}" for item in issue.evidence),
+            language="text",
+        )
+    else:
+        st.warning("This finding has no grounded evidence lines.")
+
+    st.markdown("**Why the evidence suggests this issue**")
+    if issue.hypothesis:
+        st.write(issue.hypothesis)
+        st.caption(
+            "AI hypothesis — plausible, but not confirmed by execution. Only the "
+            "lines above are observed."
+        )
+    else:
+        st.caption("No AI hypothesis for this finding; treat only the lines as evidence.")
+
+    st.markdown("**Uploaded files**")
+    for item in session.files:
+        st.write(
+            f"- `{item.name}` · {item.kind} · {item.line_count:,} lines · "
+            f"`{item.sha256[:12]}…`"
+        )
+
+    log_files = [item for item in session.files if item.kind == "log"]
+    if log_files:
+        st.markdown("**Supporting error-log excerpts**")
+        for log_file in log_files:
+            safe, _ = logs.redact(log_file.text)
+            excerpt = "\n".join(safe.splitlines()[:15])
+            with st.expander(f"`{log_file.name}` — first 15 redacted lines"):
+                st.code(excerpt or "(empty)", language="text")
+    else:
+        st.caption("No error log was uploaded for this review.")
+
+
+def _render_studio_fix(session, proposal) -> None:
+    """B. Fix proposal, reviewable diff, staging, and verification."""
     st.markdown("**Explanation**")
     st.write(proposal.explanation or "(none provided)")
 
@@ -841,7 +1023,7 @@ def _render_fix_proposal(session: magic.MagicSession, proposal: magic.FixProposa
     else:
         st.write("(not specified)")
 
-    changed_paths = {patch_file.path for patch_file in proposal.validation.files}
+    changed_paths = {file_patch.path for file_patch in proposal.validation.files}
     for path, _ in proposal.files_changed:
         if path not in changed_paths:
             st.caption(
@@ -867,16 +1049,18 @@ def _render_fix_proposal(session: magic.MagicSession, proposal: magic.FixProposa
         st.write("(none provided)")
 
     st.markdown("**Reviewable diff (validated, canonical)**")
-    st.code(proposal.diff, language="diff")
+    st.code(logs.redact(proposal.diff)[0], language="diff")
 
     st.markdown("**Before / after**")
     for file_patch in proposal.validation.files:
-        with st.expander(f"`{file_patch.path}` · +{file_patch.added} / -{file_patch.removed}"):
+        with st.expander(
+            f"`{file_patch.path}` · +{file_patch.added} / -{file_patch.removed}"
+        ):
             before_col, after_col = st.columns(2)
             before_col.markdown("**Before (uploaded snapshot)**")
-            before_col.code(file_patch.before or "(empty)", language="text")
+            before_col.code(logs.redact(file_patch.before)[0] or "(empty)", language="text")
             after_col.markdown("**After (proposed)**")
-            after_col.code(file_patch.after or "(empty)", language="text")
+            after_col.code(logs.redact(file_patch.after)[0] or "(empty)", language="text")
 
     if proposal.workspace:
         current = {item.name: item.sha256 for item in session.files}
@@ -901,6 +1085,183 @@ def _render_fix_proposal(session: magic.MagicSession, proposal: magic.FixProposa
                 st.rerun()
             except magic.MagicInputError as exc:
                 st.error(f"Could not stage the proposal: {exc}")
+
+
+def _render_studio_regression(session, proposal, issue) -> None:
+    """C. Regression-test recommendation. Proposed, never executed."""
+    status = analysis.provider_status()
+    if issue is None:
+        st.info("Select an issue first.")
+        return
+
+    reg = session.regression
+    if reg is not None:
+        if reg.is_proposed:
+            st.success(
+                "**Proposed regression test — not executed.** ReproKit never runs "
+                "uploaded or generated code.",
+                icon="🧪",
+            )
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("Status", reg.status)
+            col_b.metric("Framework", reg.framework or "pytest")
+            col_c.metric("Language", reg.language or "python")
+            st.markdown("**Proposed test** — not executed")
+            st.caption(reg.scenario or "(scenario not described)")
+            if reg.preconditions:
+                st.markdown("**Input / preconditions**")
+                for item in reg.preconditions:
+                    st.write(f"- {item}")
+            st.caption(reg.expected_behavior or "(expected behavior not described)")
+            st.markdown(f"**Why it catches a recurrence:** {reg.why_it_catches or '(not described)'}")
+            st.caption(f"Linked finding: `{issue.id}` · evidence: "
+                       + ", ".join(item.label for item in issue.evidence))
+            if reg.code:
+                st.code(reg.code, language="python")
+            if reg.limitations:
+                st.markdown("**Limitations**")
+                for item in reg.limitations:
+                    st.write(f"- {item}")
+        else:
+            st.warning(
+                "**No runnable regression test was generated.** " + (
+                    reg.limitations[0] if reg.limitations else ""
+                )
+            )
+            for item in reg.limitations[1:]:
+                st.write(f"- {item}")
+
+    if not status.available:
+        st.caption(f"AI test recommendation unavailable: {status.reason}")
+    if st.button("Recommend one regression test", type="primary", use_container_width=False):
+        if not status.available:
+            session.regression = studio.regression_not_generated(
+                "AI provider is not configured, so no test could be recommended. "
+                "Add GROQ_API_KEY and try again.",
+                issue=issue,
+                evidence=[item.label for item in issue.evidence],
+            )
+        else:
+            context = (
+                magic.build_fix_context(
+                    session.files, issue, session.shareable_answers()
+                )
+                + "\n\n=== PROPOSED FIX ===\n"
+                + proposal.diff
+            )
+            result = analysis.propose_regression_test(
+                context, shared_answers=session.shareable_answers()
+            )
+            if result.data is not None:
+                session.regression = studio.regression_from_ai(
+                    result.data,
+                    issue=issue,
+                    evidence=[item.label for item in issue.evidence],
+                    files=session.files,
+                )
+                if not result.ok and result.error:
+                    session.regression.limitations.append(result.error)
+            else:
+                session.regression = studio.regression_not_generated(
+                    result.error or "The AI request failed.",
+                    issue=issue,
+                    evidence=[item.label for item in issue.evidence],
+                )
+        st.rerun()
+
+
+def _render_studio_downloads(session, proposal, issue) -> None:
+    """D/E. Corrected-file generation and the downloadable fix report."""
+    st.markdown("**Generate corrected copies**")
+    st.caption(
+        "Creates separate files from the validated diff. Your uploads are never "
+        "modified, and the generated code is not executed."
+    )
+    mode = st.radio(
+        "Comment style",
+        options=[studio.COMMENT_MODE_CLEAN, studio.COMMENT_MODE_EXPLAIN],
+        index=0,
+        horizontal=True,
+        key="studio_comment_mode",
+        format_func=lambda value: (
+            "Explain the fix — concise comments"
+            if value == studio.COMMENT_MODE_EXPLAIN
+            else "Clean fix — minimal code"
+        ),
+    )
+
+    if st.button("Generate corrected copies", type="primary", use_container_width=False):
+        corrected, error = studio.generate_corrected_files(
+            session.files,
+            proposal.validation,
+            mode=mode,
+            reason=(proposal.explanation or (issue.title if issue else "verified fix")),
+        )
+        if error:
+            st.error(f"Could not generate corrected files: {error}")
+        else:
+            session.corrected_files = corrected
+            session.comment_mode = mode
+            st.rerun()
+
+    if session.corrected_files:
+        st.markdown(f"**Corrected copies ({session.comment_mode} mode)**")
+        for item in session.corrected_files:
+            state = (
+                "parses"
+                if item.syntax_ok is True
+                else "parse failed"
+                if item.syntax_ok is False
+                else "unparsed"
+            )
+            with st.expander(
+                f"`{item.name}` → `{studio.corrected_download_name(item.name, item.mode)}` "
+                f"· +{item.added}/-{item.removed} · {state}"
+            ):
+                st.caption(
+                    f"{item.syntax_note} Comments added: {item.comments_added}; "
+                    f"redactions: {item.redactions}. Parsing is not proof of "
+                    "correctness; inspect it for secrets before sharing."
+                )
+                st.code(item.corrected or "(empty)", language="text")
+                st.download_button(
+                    f"Download {studio.corrected_download_name(item.name, item.mode)}",
+                    data=item.corrected,
+                    file_name=studio.corrected_download_name(item.name, item.mode),
+                    mime="text/plain",
+                    key=f"download_corrected_{item.name}_{item.mode}",
+                )
+    else:
+        st.caption("No corrected copies generated yet.")
+
+    st.divider()
+    st.markdown("**Fix report**")
+    log_excerpts: list[str] = []
+    for item in session.files:
+        if item.kind == "log":
+            safe, _ = logs.redact(item.text)
+            log_excerpts.append("\n".join(safe.splitlines()[:10]))
+    report_markdown = studio.build_fix_report(
+        issue=issue,
+        files=session.files,
+        log_excerpts=log_excerpts,
+        proposal=proposal,
+        regression=session.regression,
+        verification=session.verification,
+        corrected=session.corrected_files,
+        comment_mode=session.comment_mode,
+    )
+    st.caption(
+        "Report separates observed evidence, AI hypotheses, completed checks, and "
+        "proposed-but-unexecuted tests. Secrets are redacted."
+    )
+    st.download_button(
+        "Download Evidence-to-Fix report (Markdown)",
+        data=report_markdown,
+        file_name=studio.report_download_name(issue.title if issue else ""),
+        mime="text/markdown",
+        use_container_width=False,
+    )
 
 
 def _render_verification(session: magic.MagicSession, proposal: magic.FixProposal) -> None:
@@ -939,6 +1300,7 @@ def _render_verification(session: magic.MagicSession, proposal: magic.FixProposa
         except verify.VerificationInputError as exc:
             st.error(f"Verification blocked: {exc}")
         else:
+            session.set_step("verify")
             st.rerun()
 
     report = session.verification
@@ -983,39 +1345,91 @@ def _render_verification(session: magic.MagicSession, proposal: magic.FixProposa
 
 
 def _run_magic_analysis(session: magic.MagicSession) -> None:
-    """Deterministic log issues first, then bounded AI review of code/text."""
+    """Analyze each upload independently; correlate nothing without evidence."""
+    _clear_magic_proposal_state(session)
     log_issues = magic.issues_from_logs(session.files)
+    static_issues, static_notes = magic.analyze_static(session.files)
     ai_issues: list[magic.Issue] = []
-    note = ""
-
-    has_ai_targets = any(item.kind in ("code", "text") for item in session.files)
     status = analysis.provider_status()
 
-    if not has_ai_targets:
-        note = (
-            "Log files were grouped deterministically. Upload code or text files "
-            "for AI-assisted review."
-        )
-    elif not status.available:
-        note = f"AI review unavailable: {status.reason}"
-    else:
-        excerpt = magic.build_issue_excerpt(session.files)
-        result = analysis.analyze_magic_issues(
-            excerpt, shared_answers=session.shareable_answers()
-        )
-        if result.ok and result.data is not None:
-            ai_issues = magic.issues_from_ai(
-                result.data.issues, session.files, existing=log_issues
+    if status.available:
+        for item in (file for file in session.files if file.kind == "log"):
+            parsed = logs.parse_log(item.text.encode("utf-8"), item.name)
+            if not parsed.groups:
+                continue
+            result = analysis.analyze_log_excerpt(logs.build_ai_excerpt(parsed.groups))
+            if not result.ok or result.data is None:
+                if result.error:
+                    static_notes.append(f"{item.name}: AI log analysis unavailable: {result.error}")
+                continue
+            by_key = {
+                issue.source_key: issue
+                for issue in log_issues
+                if issue.evidence and issue.evidence[0].file == item.name
+            }
+            for finding in result.data.findings:
+                target = by_key.get(finding.group_key)
+                if target is None:
+                    continue
+                hypothesis, _ = logs.redact(finding.likely_cause)
+                if not magic.has_unknown_filename(hypothesis, [item.name]):
+                    target.hypothesis = hypothesis
+                else:
+                    target.hypothesis = ""
+                safe_steps = []
+                for step in finding.recommended_steps:
+                    safe_step, _ = logs.redact(step)
+                    if not magic.has_unknown_filename(safe_step, [item.name]):
+                        safe_steps.append(safe_step)
+                target.recommendations = safe_steps or target.recommendations
+                if safe_steps:
+                    target.recommendations_source = "ai"
+            static_notes.append(
+                f"{item.name}: AI log causes and steps are hypotheses matched to exact observed groups."
             )
-            note = (
-                f"AI review by {result.data.provider} (`{result.data.model}`) — "
-                "hypotheses only. Ungrounded references were discarded."
-            )
-        else:
-            note = f"AI review failed: {result.error}"
 
-    session.set_issues(list(log_issues) + ai_issues)
-    session.analysis_note = note
+    ai_targets = [item for item in session.files if item.kind != "log"]
+    if status.available:
+        for item in ai_targets:
+            excerpt = magic.build_issue_excerpt([item])
+            result = analysis.analyze_magic_issues(
+                excerpt, shared_answers=session.shareable_answers()
+            )
+            if result.ok and result.data is not None:
+                ai_issues.extend(
+                    magic.issues_from_ai(result.data.issues, [item])
+                )
+                static_notes.append(
+                    f"{item.name}: AI review completed; ungrounded references were discarded."
+                )
+            elif result.error:
+                static_notes.append(f"{item.name}: AI review unavailable: {result.error}")
+    elif ai_targets:
+        static_notes.append(f"AI review unavailable: {status.reason}")
+
+    session.set_issues(list(log_issues) + static_issues + ai_issues)
+    if session.issues:
+        session.set_step("evidence")
+    session.analysis_note = " ".join(static_notes) or (
+        "Analysis completed. Syntax checks do not prove general logic correctness."
+    )
+    source_issue = next(
+        (issue for issue in session.issues if issue.category != "log"),
+        None,
+    )
+    if source_issue is not None:
+        session.select_issue(source_issue.id)
+        _run_propose_fix(session, source_issue)
+
+
+def _clear_magic_proposal_state(session: magic.MagicSession) -> None:
+    """Discard proposals and verification tied to prior inputs or findings."""
+    session.fix_proposal = None
+    session.proposal = None
+    session.verification = None
+    session.corrected_files = []
+    st.session_state.pop("studio_regression_key", None)
+    st.session_state.pop("studio_regression", None)
 
 
 def _render_magic_question(session: magic.MagicSession, question: magic.Question) -> None:
@@ -1072,7 +1486,7 @@ def _render_magic_privacy(session: magic.MagicSession) -> None:
         st.markdown(
             "- **Share** — may be included in the AI prompt.\n"
             "- **Private** — stored locally for this session, **never sent to AI**.\n"
-            "- **Skip** — not used at all.\n"
+            "- **Skip** — not used at all. Answers are optional; analysis and fixes proceed without them.\n"
         )
         st.caption(
             f"Private answers this session: {session.private_answer_count()} · "
@@ -1084,150 +1498,86 @@ def _render_magic_privacy(session: magic.MagicSession) -> None:
             "- Uploaded code is **never executed** and no shell commands are run.\n"
             "- Every evidence reference is checked against a real uploaded line; "
             "invalid references are discarded.\n"
-            "- Originals are preserved; no patches are generated in this stage.\n"
+            "- Originals are immutable; proposed changes are applied only to separate copies.\n"
             "- Secrets are redacted before display and before any AI call."
         )
     ui.footer_quote()
 
 
 def render_intro() -> None:
-    """Landing page: what ReproKit is for, who feels the pain, and why it is different."""
+    """Landing page: what ReproKit is for, then straight into the studio."""
     ui.landing_hero(
         kicker="Welcome to the studio",
         name="Repro",
         emphasis="Kit",
         subname="The Bug Reproduction Studio",
         purpose_html=(
-            "ReproKit is a <strong>bug-reproduction studio</strong> for people who are "
-            "tired of guessing. Upload code and logs, reproduce the failure with real "
-            "test evidence, and review AI suggestions without ever confusing a "
-            "plausible story with a proven result."
+            "A <strong>bug-reproduction studio</strong>: reproduce a failure with real "
+            "test evidence, then review AI suggestions without mistaking a good story "
+            "for a proven result."
         ),
         chips=("Reproduce", "Review", "Decide"),
     )
 
     ui.section(
         "The swarm",
-        "Every bug starts as a blur",
-        "Twelve scattered symptoms, one shape hiding underneath. Release them and "
-        "watch them settle into the name.",
+        "A mess, until you settle it",
+        "One click tidies the bubbles — the way a real bug report tidies a symptom.",
     )
     ui.swarm(bool(st.session_state.get("rk_swarm_open")))
-    release_label = (
-        "Release the swarm again"
-        if st.session_state.get("rk_swarm_open")
-        else "Release the swarm"
-    )
-    if st.button(release_label, type="primary", use_container_width=False):
-        st.session_state["rk_swarm_open"] = not st.session_state.get("rk_swarm_open")
-        st.rerun()
 
-    ui.section(
-        "Why it exists",
-        "Three ways bugs waste your day",
-        "Every one of these starts with the same mistake: treating a hunch as proof.",
+    _, centre, _ = st.columns([1, 1.35, 1])
+    with centre:
+        release_label = (
+            "Settle it again"
+            if st.session_state.get("rk_swarm_open")
+            else "Settle the swarm"
+        )
+        if st.button(release_label, use_container_width=True):
+            st.session_state["rk_swarm_open"] = not st.session_state.get("rk_swarm_open")
+            st.rerun()
+        if st.button("Enter the studio", type="primary", use_container_width=True):
+            st.session_state["rk_entered"] = True
+            st.rerun()
+
+    ui.cta_note(
+        [
+            ("Start here:", "the proven demo, end to end."),
+            ("No setup:", "works without an AI key."),
+            ("Safe:", "uploaded code is never executed."),
+        ]
     )
+
+    ui.section("Why it exists", "Three ways bugs waste a day", "")
     ui.pillars(
         [
             (
                 "01 · REPRODUCE",
                 "It worked on my machine",
-                "A failure you cannot re-run is a rumour. ReproKit turns it into a "
-                "command, an exit code, and captured output you can hand to someone.",
+                "An un-runnable failure is a rumour. Here it becomes a command, an exit "
+                "code, and captured output.",
             ),
             (
                 "02 · REVIEW",
-                "The log says everything and nothing",
-                "Thousands of lines, one buried exception. Evidence gets grouped, "
-                "redacted, and shown next to the exact line that produced it.",
+                "The log says everything",
+                "A thousand lines, one buried exception. Evidence gets grouped and "
+                "redacted before anyone reads it.",
             ),
             (
                 "03 · DECIDE",
                 "The fix that wasn't",
-                "AI can write a confident patch for the wrong file. Here proposals are "
-                "validated against your real snapshot and labelled unverified until "
-                "checks actually run.",
+                "AI can patch the wrong file with total confidence. Proposals are "
+                "validated, never auto-applied, and never called verified.",
             ),
         ]
     )
 
-    ui.section(
-        "From the trenches",
-        "What developers actually say",
-        "Anonymous voices from everyday debugging. No heroics, just the loop we all know.",
-    )
-    ui.struggles(
-        [
-            (
-                "Spent two days on a bug that only appeared because one config line "
-                "differed between staging and production.",
-                "Backend developer · 6 years in",
-            ),
-            (
-                "The AI gave me a beautiful patch. It renamed a file, broke the import "
-                "graph, and was completely confident about it.",
-                "Platform engineer · 4 years in",
-            ),
-            (
-                "Best debugging tool I ever had was a test that failed the same way "
-                "twice in a row.",
-                "QA engineer · 9 years in",
-            ),
-        ]
+    ui.quote(
+        "Programs must be written for people to read, and only incidentally for "
+        "machines to execute.",
+        "Abelson & Sussman, Structure and Interpretation of Computer Programs",
     )
 
-    ui.voices(
-        (
-            "Programs must be written for people to read, and only incidentally for "
-            "machines to execute.",
-            "Harold Abelson & Gerald Jay Sussman, Structure and Interpretation of "
-            "Computer Programs",
-        ),
-        (
-            "A hypothesis is a question with good posture. Evidence is the answer.",
-            "ReproKit principle",
-        ),
-    )
-
-    ui.section(
-        "How it works",
-        "Two modes, one rule",
-        "The rule is simple: observed evidence outranks any opinion — human or model.",
-    )
-    ui.pillars(
-        [
-            (
-                "LOGIC MODE",
-                "Prove it",
-                "Allowlisted pytest runs, before/after comparison, and log analysis. "
-                "Real commands, real exit codes, nothing hard-coded.",
-            ),
-            (
-                "MAGIC MODE",
-                "Investigate it",
-                "Upload your own files, get grounded findings, answer only what you "
-                "choose to share, then review a diff — never auto-applied.",
-            ),
-            (
-                "THE RULE",
-                "Never pretend",
-                "Inconclusive stays inconclusive. Static verification never claims "
-                "runtime success. Secrets are redacted before anything is sent.",
-            ),
-        ]
-    )
-
-    st.write("")
-    if st.button("Enter the studio", type="primary", use_container_width=False):
-        st.session_state["rk_entered"] = True
-        st.rerun()
-    ui.cta_note(
-        [
-            ("Start here:", "Logic Mode runs the proven demo end to end."),
-            ("No setup:", "works without an AI key; add one for analysis."),
-            ("Safe by default:", "uploaded code is never executed."),
-        ]
-    )
     ui.footer_quote()
 
 

@@ -1,22 +1,33 @@
 """Magic Mode: uploads, grounded issues, privacy-filtered answers, workflow state.
 
-Stage 2 scope:
+Workflow features:
 - deterministic log issue grouping (reusing :mod:`reprokit.logs`)
 - bounded, redacted code/text excerpts for AI issue detection
 - every evidence reference is resolved against the uploaded file (file + line)
   so the UI can show the exact supporting lines; unknown refs are discarded
 - follow-up questions with explicit Share / Private / Skip visibility
+- validated proposals are staged as copies in a temporary workspace
 
-Nothing here runs uploaded code, writes to originals, or applies patches.
+Uploaded code is never executed, and original snapshots are never modified.
 """
 
 from __future__ import annotations
 
 import hashlib
+import ast
+import configparser
+import difflib
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Literal, Optional, Sequence
+import xml.etree.ElementTree as ET
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
 
 from reprokit import logs
 from reprokit.logs import MAX_FILE_BYTES, MAX_LINE_CHARS, redact
@@ -35,8 +46,10 @@ SEVERITIES = ("critical", "high", "medium", "low")
 # Filenames mentioned by AI text, used to catch references to files that were
 # never uploaded (the model sometimes invents names).
 _FILENAME_RE = re.compile(
-    r"\b[\w./\\-]+\.(?:py|pyi|js|jsx|ts|tsx|java|kt|go|rb|rs|cs|c|h|cpp|hpp|"
-    r"php|swift|scala|sh|ps1|sql|log|txt|md|json|ya?ml|toml|ini|cfg|conf|csv)\b",
+    r"\b[\w./\\-]+\.(?:py|pyi|js|jsx|ts|tsx|mjs|cjs|java|kt|go|rb|rs|cs|c|h|"
+    r"cpp|cc|cxx|hpp|hxx|php|swift|scala|sh|ps1|sql|dart|lua|pl|r|ex|exs|hs|"
+    r"log|out|trace|txt|md|json|ya?ml|toml|ini|cfg|conf|csv|tsv|xml|html?|css|"
+    r"scss|less|properties|env)\b",
     re.IGNORECASE,
 )
 
@@ -44,12 +57,17 @@ CODE_EXTENSIONS = frozenset(
     {
         ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go",
         ".rb", ".rs", ".cs", ".c", ".h", ".cpp", ".hpp", ".php", ".swift",
-        ".scala", ".sh", ".ps1", ".sql",
+        ".scala", ".sh", ".ps1", ".sql", ".mjs", ".cjs", ".cc", ".cxx",
+        ".hxx", ".dart", ".lua", ".pl", ".r", ".ex", ".exs", ".hs",
     }
 )
-LOG_EXTENSIONS = frozenset({".log"})
+LOG_EXTENSIONS = frozenset({".log", ".out", ".trace"})
 TEXT_EXTENSIONS = frozenset(
-    {".txt", ".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".csv"}
+    {
+        ".txt", ".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+        ".conf", ".csv", ".tsv", ".xml", ".html", ".htm", ".css", ".scss",
+        ".less", ".properties", ".env",
+    }
 )
 ALLOWED_EXTENSIONS = CODE_EXTENSIONS | LOG_EXTENSIONS | TEXT_EXTENSIONS
 
@@ -57,11 +75,11 @@ FileKind = Literal["code", "log", "text"]
 Visibility = Literal["shared", "private", "skipped"]
 
 WORKFLOW_STEPS: tuple[tuple[str, str], ...] = (
-    ("upload", "Upload code, log, and text files"),
-    ("group", "Group issues found across the uploads"),
-    ("questions", "Answer targeted follow-up questions"),
-    ("proposal", "Generate a reviewable diff proposal"),
-    ("verify", "Verify the proposal with approved tests"),
+    ("upload", "Upload supported files"),
+    ("analyze", "Analyze automatically"),
+    ("evidence", "Review evidence and findings"),
+    ("proposal", "Generate safe corrected copies"),
+    ("verify", "Verify and download report"),
 )
 
 _KNOWN_STEPS = {key for key, _ in WORKFLOW_STEPS}
@@ -83,9 +101,15 @@ class UnsupportedFileTypeError(MagicInputError):
     """Raised when an upload's extension is not allowed."""
 
 
+class BinaryFileError(MagicInputError):
+    """Raised when an upload is binary and cannot safely be analyzed as text."""
+
+
 def classify_extension(filename: str) -> FileKind:
     """Map a filename to code/log/text, or raise UnsupportedFileTypeError."""
     lowered = (filename or "").lower()
+    if lowered in {"dockerfile", "makefile"}:
+        return "code"
     dot = lowered.rfind(".")
     extension = lowered[dot:] if dot != -1 else ""
     if extension in CODE_EXTENSIONS:
@@ -111,6 +135,7 @@ class MagicFile:
     text: str
     line_count: int
     warnings: tuple[str, ...] = ()
+    format: str = "plain text"
 
     def preview(self, max_lines: int = 20, max_chars: int = 2_000) -> str:
         """Redacted, bounded preview for display only."""
@@ -163,6 +188,16 @@ class Issue:
     hypothesis: str = ""  # AI only; never observed fact
     questions: list[Question] = field(default_factory=list)
     severity_source: str = "observed"  # "observed" | "ai"
+    confidence: float = 0.5
+    observed_problem: str = ""
+    why_it_matters: str = ""
+    proposed_correction: str = ""
+    fix_diff: str = ""
+    assumptions: list[str] = field(default_factory=list)
+    verification_status: str = "inconclusive"
+    recommendations: list[str] = field(default_factory=list)
+    recommendations_source: str = "deterministic"
+    source_key: str = ""
 
     @property
     def is_ai_hypothesis(self) -> bool:
@@ -184,7 +219,7 @@ class Answer:
 
 @dataclass
 class MagicSession:
-    """All Magic Mode state. Stage 2 stores inputs, issues, and answers."""
+    """All per-session Magic Mode inputs, findings, proposals, and answers."""
 
     files: list[MagicFile] = field(default_factory=list)
     questions: list[Question] = field(default_factory=list)
@@ -193,8 +228,11 @@ class MagicSession:
     selected_issue_id: Optional[str] = None
     analysis_note: str = ""
     fix_proposal: Optional["FixProposal"] = None
+    regression: Optional[object] = None
+    corrected_files: list = field(default_factory=list)
+    comment_mode: str = "clean"
     step: str = "upload"
-    proposal: Optional[str] = None  # reserved; not implemented yet
+    proposal: Optional[str] = None  # canonical proposal diff after staging
     verification: Optional[object] = None  # verify.VerificationReport when present
     notes: list[str] = field(default_factory=list)
 
@@ -214,8 +252,8 @@ class MagicSession:
         self.questions = [q for issue in self.issues for q in issue.questions]
         if self.selected_issue_id not in {i.id for i in self.issues}:
             self.selected_issue_id = self.issues[0].id if self.issues else None
-        if self.issues and self.step in ("upload", "group"):
-            self.step = "questions"
+        if self.issues and self.step in ("upload", "analyze"):
+            self.step = "evidence"
 
     def select_issue(self, issue_id: str) -> Issue:
         for issue in self.issues:
@@ -271,15 +309,17 @@ def ingest_files(uploads: Iterable[tuple[str, bytes]]) -> list[MagicFile]:
         safe_name = (name or "unnamed").replace("\\", "/").split("/")[-1]
         if not safe_name:
             raise MagicInputError("A file has an empty name.")
-        if safe_name in seen:
+        name_key = safe_name.casefold()
+        if name_key in seen:
             raise MagicInputError(
                 f"Duplicate filename {safe_name!r}; rename files instead of "
                 "overwriting."
             )
-        seen.add(safe_name)
+        seen.add(name_key)
 
         kind = classify_extension(safe_name)
-        size = len(raw or b"")
+        uploaded_bytes = raw or b""
+        size = len(uploaded_bytes)
         if size == 0:
             raise MagicInputError(f"{safe_name} is empty.")
         if size > MAX_FILE_BYTES:
@@ -293,13 +333,26 @@ def ingest_files(uploads: Iterable[tuple[str, bytes]]) -> list[MagicFile]:
             )
 
         warnings: list[str] = []
-        if b"\x00" in raw:
-            warnings.append("Binary content detected; treated as text with NUL bytes removed.")
-            raw = raw.replace(b"\x00", b"")
+        if b"\x00" in uploaded_bytes:
+            raise BinaryFileError(
+                f"{safe_name} contains NUL bytes and appears binary; it was not analyzed."
+            )
+        control_bytes = sum(
+            byte < 9 or 13 < byte < 32 for byte in uploaded_bytes
+        )
+        if uploaded_bytes and control_bytes / len(uploaded_bytes) > 0.05:
+            raise BinaryFileError(
+                f"{safe_name} contains binary control bytes; it was not analyzed."
+            )
+        content = uploaded_bytes
         try:
-            text = raw.decode("utf-8")
+            text = content.decode("utf-8")
         except UnicodeDecodeError:
-            text = raw.decode("utf-8", errors="replace")
+            text = content.decode("utf-8", errors="replace")
+            if text.count("\ufffd") / max(len(text), 1) > 0.30:
+                raise BinaryFileError(
+                    f"{safe_name} contains mostly non-text bytes; it was not analyzed."
+                )
             warnings.append("Not valid UTF-8; undecodable bytes were replaced.")
 
         results.append(
@@ -307,14 +360,203 @@ def ingest_files(uploads: Iterable[tuple[str, bytes]]) -> list[MagicFile]:
                 name=safe_name,
                 kind=kind,
                 size_bytes=size,
-                sha256=hashlib.sha256(raw).hexdigest(),
+                sha256=hashlib.sha256(uploaded_bytes).hexdigest(),
                 text=text,
                 line_count=len(text.splitlines()),
                 warnings=tuple(warnings),
+                format=_format_for_name(safe_name),
             )
         )
 
     return results
+
+
+_LANGUAGES = {
+    ".py": "Python", ".pyi": "Python", ".js": "JavaScript",
+    ".jsx": "JavaScript/JSX", ".mjs": "JavaScript", ".cjs": "JavaScript",
+    ".ts": "TypeScript", ".tsx": "TypeScript/JSX", ".java": "Java",
+    ".kt": "Kotlin", ".go": "Go", ".rb": "Ruby", ".rs": "Rust",
+    ".cs": "C#", ".c": "C", ".h": "C/C++ header", ".cpp": "C++",
+    ".cc": "C++", ".cxx": "C++", ".hpp": "C++ header",
+    ".hxx": "C++ header", ".php": "PHP", ".swift": "Swift",
+    ".scala": "Scala", ".sh": "Shell", ".ps1": "PowerShell",
+    ".sql": "SQL", ".dart": "Dart", ".lua": "Lua", ".pl": "Perl",
+    ".r": "R", ".ex": "Elixir", ".exs": "Elixir", ".hs": "Haskell",
+    ".json": "JSON", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML",
+    ".xml": "XML", ".html": "HTML", ".htm": "HTML", ".css": "CSS",
+    ".scss": "SCSS", ".less": "Less", ".ini": "INI", ".cfg": "INI",
+    ".conf": "configuration text", ".properties": "Java properties",
+    ".env": "environment configuration", ".csv": "CSV", ".tsv": "TSV",
+    ".log": "application log", ".out": "text log", ".trace": "trace log",
+    ".md": "Markdown", ".txt": "plain text",
+}
+
+
+def _format_for_name(filename: str) -> str:
+    lowered = filename.lower()
+    if lowered in {"dockerfile", "makefile"}:
+        return "Dockerfile" if lowered == "dockerfile" else "Makefile"
+    if lowered == ".env":
+        return "environment configuration"
+    return _LANGUAGES.get(Path(lowered).suffix, "plain text")
+
+
+def analyze_static(files: Sequence[MagicFile]) -> tuple[list[Issue], list[str]]:
+    """Run safe, deterministic parsers and narrowly-scoped source heuristics."""
+    issues: list[Issue] = []
+    notes: list[str] = []
+    for item in files:
+        if item.kind == "log":
+            continue
+        suffix = Path(item.name).suffix.lower()
+        text = item.text
+        try:
+            if suffix in (".py", ".pyi"):
+                ast.parse(text, filename=item.name)
+            elif suffix == ".json":
+                json.loads(text)
+            elif suffix == ".toml" and tomllib is not None:
+                tomllib.loads(text)
+            elif suffix == ".ini":
+                configparser.ConfigParser().read_string(text)
+            elif suffix == ".xml":
+                ET.fromstring(text)
+            else:
+                notes.append(
+                    f"{item.name}: identified as {item.format}; no installed "
+                    "static validator is available for this format."
+                )
+                continue
+        except json.JSONDecodeError as exc:
+            issues.append(
+                _static_error_issue(
+                    item, exc.lineno, f"Malformed JSON: {exc.msg}", 1.0
+                )
+            )
+            continue
+        except ET.ParseError as exc:
+            line = exc.position[0] if exc.position else 1
+            issues.append(
+                _static_error_issue(item, line, f"Malformed XML: {exc}", 1.0)
+            )
+            continue
+        except configparser.Error as exc:
+            parse_errors = getattr(exc, "errors", [])
+            line = parse_errors[0][0] if parse_errors else getattr(exc, "lineno", 1)
+            issues.append(
+                _static_error_issue(item, line, f"Malformed INI: {exc}", 1.0)
+            )
+            continue
+        except SyntaxError as exc:
+            line = exc.lineno or 1
+            message = f"Python syntax error: {exc.msg}"
+            issues.append(_static_error_issue(item, line, message, 1.0))
+            continue
+        except RecursionError:
+            notes.append(
+                f"{item.name}: the static parser exceeded its nesting limit; "
+                "validation is inconclusive."
+            )
+            continue
+        except (ValueError, TypeError) as exc:
+            # TOMLDecodeError is a ValueError; lineno is unavailable on some
+            # Python releases, so fall back to the first line there.
+            if suffix == ".toml":
+                line = getattr(exc, "lineno", 1)
+                issues.append(
+                    _static_error_issue(item, line, f"Malformed TOML: {exc}", 1.0)
+                )
+                continue
+            raise
+
+        if suffix in (".py", ".pyi"):
+            issue = _whitespace_length_issue(item)
+            if issue is not None:
+                issues.append(issue)
+            else:
+                notes.append(
+                    f"{item.name}: Python AST parsing passed; this checks syntax "
+                    "only, not runtime behavior or general logic correctness."
+                )
+        elif suffix in (".json", ".toml", ".xml", ".ini"):
+            notes.append(f"{item.name}: {item.format} syntax validation passed.")
+
+    return issues, notes
+
+
+def _static_error_issue(
+    item: MagicFile, line: int, message: str, confidence: float
+) -> Issue:
+    line = min(max(line, 1), max(item.line_count, 1))
+    evidence = resolve_evidence([(item)], [(item.name, line)])
+    return Issue(
+        id=f"static:{item.name}:{line}",
+        title=message,
+        category="text" if item.kind == "text" else "code",
+        severity="high",
+        evidence=evidence,
+        hypothesis=f"The {item.format} parser reported a malformed or invalid construct.",
+        severity_source="observed",
+        confidence=confidence,
+        observed_problem=message,
+        why_it_matters="The file cannot be parsed reliably by tools that expect valid syntax.",
+        verification_status="failed",
+    )
+
+
+def _whitespace_length_issue(item: MagicFile) -> Optional[Issue]:
+    """Flag one concrete Python validation pitfall with its explicit assumption."""
+    lines = item.text.splitlines()
+    pattern = re.compile(r"^(\s*)return\s+len\(([A-Za-z_]\w*)\)\s*>\s*0\s*$")
+    for number, line in enumerate(lines, start=1):
+        match = pattern.match(line)
+        if not match:
+            continue
+        indent, variable = match.groups()
+        changed_line = f"{indent}return len({variable}.strip()) > 0"
+        after = list(lines)
+        after[number - 1] = changed_line
+        before_text = item.text
+        after_text = "\n".join(after) + ("\n" if item.text.endswith("\n") else "")
+        diff_lines = list(
+            difflib.unified_diff(
+                before_text.splitlines(keepends=True),
+                after_text.splitlines(keepends=True),
+                fromfile=f"a/{item.name}",
+                tofile=f"b/{item.name}",
+            )
+        )
+        diff = "".join(diff_lines)
+        if diff.startswith("--- "):
+            diff = diff.replace("--- a/", "--- a/", 1)
+        return Issue(
+            id=f"static:logic:{item.name}:{number}",
+            title="Whitespace-only input passes a non-empty check",
+            category="code",
+            severity="medium",
+            evidence=resolve_evidence([(item)], [(item.name, number)]),
+            hypothesis=(
+                "This check returns true for a string containing only spaces. "
+                "Whether that is a bug depends on the intended input policy."
+            ),
+            severity_source="observed",
+            confidence=0.78,
+            observed_problem=(
+                f"len({variable}) > 0 accepts any non-empty string, including whitespace."
+            ),
+            why_it_matters=(
+                "If whitespace-only input should be rejected, this validation "
+                "allows a blank-looking value through."
+            ),
+            proposed_correction=changed_line.strip(),
+            fix_diff=diff,
+            assumptions=[
+                "Assumes this function validates human-entered text and should "
+                "reject whitespace-only values."
+            ],
+            verification_status="inconclusive",
+        )
+    return None
 
 
 def build_ai_context(
@@ -351,6 +593,7 @@ class MagicAIIssue:
     evidence_refs: list[tuple[str, int]]
     hypothesis: str = ""
     questions: list[str] = field(default_factory=list)
+    confidence: float = 0.5
 
 
 @dataclass
@@ -375,6 +618,9 @@ def resolve_evidence(
     max_refs: int = MAX_EVIDENCE_REFS,
 ) -> list[Evidence]:
     """Resolve (file, line) refs against uploads; discard anything invalid."""
+    if max_refs <= 0:
+        return []
+
     by_name = {item.name: item for item in files}
     resolved: list[Evidence] = []
     seen: set[tuple[str, int]] = set()
@@ -422,6 +668,17 @@ def issues_from_logs(files: Sequence[MagicFile]) -> list[Issue]:
                     severity=group.severity,
                     evidence=evidence,
                     severity_source="observed",
+                    confidence=1.0,
+                    observed_problem=(
+                        f"Observed {group.category} log event: {group.signature} "
+                        f"({group.count} occurrence(s))."
+                    ),
+                    why_it_matters=(
+                        "This is direct evidence of an error or service symptom, "
+                        "but does not by itself establish the underlying cause."
+                    ),
+                    recommendations=_log_remediation(group.category),
+                    source_key=group.key,
                 )
             )
     return issues
@@ -511,17 +768,25 @@ def issues_from_ai(
                 enriched_ids.add(target.id)
             continue
 
-        issue_id = f"ai:{index}:{_slug(raw.title)}"
+        issue_id = f"ai:{_slug(evidence[0].file)}:{index}:{_slug(raw.title)}"
+        safe_title, _ = logs.redact(raw.title.strip())
+        safe_hypothesis, _ = logs.redact(raw.hypothesis.strip())
+        allowed_files = [item.name for item in files]
+        if has_unknown_filename(safe_title, allowed_files):
+            safe_title = f"Finding in {evidence[0].file}"
+        if has_unknown_filename(safe_hypothesis, allowed_files):
+            safe_hypothesis = ""
         produced.append(
             Issue(
                 id=issue_id,
-                title=raw.title.strip() or "Untitled AI finding",
+                title=safe_title or "Untitled AI finding",
                 category="code" if any(f.name == evidence[0].file and f.kind == "code" for f in files) else "text",
                 severity=severity,
                 evidence=evidence,
-                hypothesis=raw.hypothesis.strip(),
+                hypothesis=safe_hypothesis,
                 questions=_make_questions(issue_id, raw.questions, evidence[0].file, [f.name for f in files]),
                 severity_source="ai",
+                confidence=min(max(raw.confidence, 0.0), 1.0),
             )
         )
 
@@ -553,7 +818,7 @@ def _make_questions(
 ) -> list[Question]:
     questions: list[Question] = []
     for index, text in enumerate(texts[:MAX_QUESTIONS_PER_ISSUE], start=1):
-        cleaned = (text or "").strip()
+        cleaned, _ = logs.redact((text or "").strip())
         if not cleaned:
             continue
         if allowed_files and has_unknown_filename(cleaned, allowed_files):
@@ -568,6 +833,32 @@ def _make_questions(
             )
         )
     return questions
+
+
+def _log_remediation(category: str) -> list[str]:
+    """Offer source-independent next steps without guessing the root cause."""
+    options = {
+        "exception": [
+            "Review the captured stack-trace frames and adjacent log lines.",
+            "Compare the failure time with recent application changes and dependency health.",
+        ],
+        "http_error": [
+            "Check server-side logs for the same request and status-code interval.",
+            "Review the request context and service health before changing application behavior.",
+        ],
+        "timeout": [
+            "Check dependency health, observed request duration, and configured timeouts.",
+            "Confirm expected latency before changing timeout settings.",
+        ],
+        "error": [
+            "Review adjacent log lines and service metrics around the recorded event.",
+            "Inspect the corresponding application or dependency health before remediation.",
+        ],
+    }
+    return options.get(
+        category,
+        ["Review surrounding log context; the underlying application source was not provided."],
+    )
 
 
 # ---------------------------------------------------------------------------

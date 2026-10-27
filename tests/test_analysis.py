@@ -473,6 +473,7 @@ _MAGIC_PAYLOAD = {
         {
             "title": "Unvalidated whitespace input",
             "severity": "high",
+            "confidence": 0.83,
             "evidence": [{"file": "app.py", "line": 2}],
             "hypothesis": "Likely caused by a length check that does not strip.",
             "questions": ["Is whitespace-only input valid?"],
@@ -492,6 +493,7 @@ def test_parse_magic_analysis_valid():
     issue = data.issues[0]
     assert issue.title == "Unvalidated whitespace input"
     assert issue.severity == "high"
+    assert issue.confidence == 0.83
     assert issue.evidence_refs == [("app.py", 2)]
     assert issue.hypothesis.startswith("Likely caused by")
     assert data.notes == ["Only one suspicious line found."]
@@ -512,6 +514,7 @@ def test_parse_magic_analysis_accepts_fenced_json():
         json.dumps({"issues": "nope"}),
         json.dumps({"issues": [{"severity": "high"}]}),  # no title
         json.dumps({"issues": [{"title": "x", "severity": "apocalyptic"}]}),
+        json.dumps({"issues": [{"title": "x", "confidence": 1.5}]}),
         json.dumps({"issues": [{"title": "x", "evidence": [{"file": "a.py"}]}]}),
         json.dumps({"issues": [{"title": "x", "evidence": [{"file": "a.py", "line": "2"}]}]}),
         json.dumps({"issues": [{"title": "x", "evidence": [{"file": "a.py", "line": True}]}]}),
@@ -736,6 +739,72 @@ def test_propose_fix_api_error_is_sanitized(monkeypatch):
     assert "Groq API call failed" in result.error
 
 
+def test_propose_regression_test_requires_scenario_and_sends_only_shared_answers(monkeypatch):
+    from reprokit import magic, studio
+
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", _GROQ_KEY)
+    response = {
+        "feasible": True,
+        "language": "python",
+        "framework": "pytest",
+        "test_filename": "test_bug.py",
+        "code": "def test_whitespace_is_rejected():\n    assert not is_valid('   ')\n",
+        "scenario": "A whitespace-only username is submitted.",
+        "preconditions": ["The fixed implementation is available."],
+        "expected_behavior": "Whitespace-only input is rejected.",
+        "why_it_catches": "The buggy implementation accepts it.",
+        "limitations": [],
+    }
+    captured = _stub_openai(monkeypatch, content=json.dumps(response))
+
+    session = magic.MagicSession()
+    session.add_question(magic.Question(id="q1", text="Share?"))
+    session.add_question(magic.Question(id="q2", text="Private?"))
+    shared = session.answer("q1", "expected input is whitespace", "shared")
+    private = session.answer("q2", "internal system name", "private")
+
+    result = analysis.propose_regression_test(
+        "source: token=gsk_abcdefghijklmnop1234",
+        shared_answers=[shared, private],
+    )
+
+    assert result.ok is True
+    assert isinstance(result.data, studio.RegressionDraft)
+    assert result.data.scenario == response["scenario"]
+    assert result.data.expected_behavior == response["expected_behavior"]
+    prompt = captured["create"]["messages"][1]["content"]
+    assert "expected input is whitespace" in prompt
+    assert "internal system name" not in prompt
+    assert "gsk_abcdefghijklmnop1234" not in prompt
+    assert "REDACTED" in prompt
+
+
+@pytest.mark.parametrize(
+    ("content", "exception"),
+    [
+        ("not json", None),
+        (None, RuntimeError("provider failure")),
+    ],
+)
+def test_propose_regression_test_fails_safely(monkeypatch, content, exception):
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", _GROQ_KEY)
+    _stub_openai(monkeypatch, content=content, exc=exception)
+
+    result = analysis.propose_regression_test("bounded source excerpt")
+
+    assert result.ok is False
+    assert result.error
+    if exception is None:
+        assert result.data is not None
+        assert result.data.code == ""
+        assert result.data.parse_error
+    else:
+        assert result.data is None
+        assert "RuntimeError" in result.error
+
+
 # ---------------------------------------------------------------------------
 # Regression: malformed AI diff envelopes / formats
 # ---------------------------------------------------------------------------
@@ -781,3 +850,129 @@ def test_fix_prompt_requires_complete_hunk_headers(monkeypatch):
     assert "complete header" in system_prompt
     assert 'A bare "@@"' in system_prompt
     assert "do NOT use Markdown fences" in system_prompt
+
+
+# ---------------------------------------------------------------------------
+# Regression-test recommendation (Evidence-to-Fix Review Studio)
+# ---------------------------------------------------------------------------
+_REG_PAYLOAD = {
+    "feasible": True,
+    "language": "python",
+    "framework": "pytest",
+    "test_filename": "test_zero_division.py",
+    "code": "def test_zero_division():\n    assert divide(1, 0) is None\n",
+    "scenario": "b == 0",
+    "preconditions": ["b == 0"],
+    "expected_behavior": "Returns None",
+    "why_it_catches": "Raises ZeroDivisionError before the fix.",
+    "limitations": ["Assumes divide accepts numbers."],
+}
+
+
+def test_parse_regression_valid():
+    from reprokit import studio
+
+    data = analysis.parse_regression_test_json(json.dumps(_REG_PAYLOAD))
+    assert isinstance(data, studio.RegressionDraft)
+    assert data.feasible is True
+    assert data.test_filename == "test_zero_division.py"
+    assert "assert divide(1, 0) is None" in data.code
+    assert data.preconditions == ["b == 0"]
+
+
+def test_parse_regression_infeasible_requires_limitation():
+    payload = {"feasible": False, "limitations": ["No module API provided."]}
+    data = analysis.parse_regression_test_json(json.dumps(payload))
+    assert data.feasible is False
+    assert data.limitations == ["No module API provided."]
+
+    with pytest.raises(analysis.MalformedAnalysisError):
+        analysis.parse_regression_test_json(
+            json.dumps({"feasible": False, "limitations": []})
+        )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "not json",
+        "[]",
+        json.dumps({"code": "x"}),  # no feasible
+        json.dumps({"feasible": "yes"}),
+        json.dumps({"feasible": True, "code": ""}),
+        json.dumps(
+            {"feasible": True, "code": "def test_a(): pass", "test_filename": "../x.py"}
+        ),
+        json.dumps({"feasible": True, "code": "x", "preconditions": "b == 0"}),
+    ],
+)
+def test_parse_regression_rejects_malformed(bad):
+    with pytest.raises(analysis.MalformedAnalysisError):
+        analysis.parse_regression_test_json(bad)
+
+
+def test_parse_regression_accepts_fenced_json():
+    data = analysis.parse_regression_test_json(
+        "```json\n" + json.dumps(_REG_PAYLOAD) + "\n```"
+    )
+    assert data.feasible is True
+
+
+def test_regression_unavailable_without_key(monkeypatch):
+    _clear_provider_env(monkeypatch)
+    result = analysis.propose_regression_test("ISSUE: x")
+    assert result.ok is False
+    assert "GROQ_API_KEY" in result.error
+
+
+def test_regression_sends_only_shared_answers(monkeypatch):
+    from reprokit import magic
+
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", _GROQ_KEY)
+    captured = _stub_openai(monkeypatch, content=json.dumps(_REG_PAYLOAD))
+
+    session = magic.MagicSession()
+    for qid in ("q1", "q2", "q3"):
+        session.add_question(magic.Question(id=qid, text=f"question {qid}"))
+    shared = session.answer("q1", "must stay Python 3", "shared")
+    private = session.answer("q2", "internal host db-prod-01", "private")
+    skipped = session.answer("q3", "ignore this", "skipped")
+
+    result = analysis.propose_regression_test(
+        "1: def divide(a, b): return a / b",
+        shared_answers=[shared, private, skipped],
+    )
+
+    assert result.ok is True
+    payload = captured["create"]["messages"][1]["content"]
+    assert "must stay Python 3" in payload
+    assert "internal host db-prod-01" not in payload
+    assert "ignore this" not in payload
+
+
+def test_regression_malformed_keeps_raw(monkeypatch):
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", _GROQ_KEY)
+    _stub_openai(monkeypatch, content="not json")
+
+    result = analysis.propose_regression_test("ISSUE: x")
+
+    assert result.ok is False
+    assert result.data is not None
+    assert result.data.raw == "not json"
+    assert result.data.parse_error
+
+
+def test_regression_api_error_is_sanitized(monkeypatch):
+    secret = "gsk-regression-secret"
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", secret)
+    _stub_openai(monkeypatch, exc=RuntimeError(f"boom {secret}"))
+
+    result = analysis.propose_regression_test("ISSUE: x")
+
+    assert result.ok is False
+    assert secret not in result.error
+    assert "Groq API call failed" in result.error

@@ -9,6 +9,7 @@ bubble swarm that settles into the letters R and K when released.
 from __future__ import annotations
 
 import html
+import math
 from string import Template
 from typing import Iterable
 
@@ -389,7 +390,7 @@ hr { border-color: var(--rk-line); }
 .rk-voice p { font-family: var(--rk-serif); font-size: 1.06rem; line-height: 1.6; margin: 0 0 10px; color: var(--rk-body); }
 .rk-voice.is-accent p { font-style: italic; }
 .rk-voice span { font-family: var(--rk-mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--rk-muted); }
-.rk-cta-note { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; color: var(--rk-muted); font-size: 13px; }
+.rk-cta-note { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px 20px; justify-content: center; text-align: center; color: var(--rk-muted); font-size: 12.5px; }
 .rk-cta-note b { color: var(--rk-ink); font-weight: 600; }
 
 /* ---------- Bubble swarm ---------- */
@@ -728,39 +729,29 @@ def cta_note(items: Iterable[tuple[str, str]]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bubble swarm: drifts, then settles into R and K
+# Bubble swarm: drifts, then settles into a calm ring
 # ---------------------------------------------------------------------------
-# 5x7 dot-matrix glyphs; "1" marks a bubble.
-_GLYPH_R = (
-    "11110",
-    "10001",
-    "10001",
-    "11110",
-    "10100",
-    "10010",
-    "10001",
-)
-_GLYPH_K = (
-    "10001",
-    "10010",
-    "10100",
-    "11000",
-    "10100",
-    "10010",
-    "10001",
-)
+_RINGS = ((0.17, 0.30), (0.30, 0.45), (0.42, 0.25))
 
 
-def _glyph_points(glyph: tuple[str, ...]) -> list[tuple[float, float]]:
-    """Normalized (x, y) centres for filled cells of a glyph."""
-    rows = len(glyph)
-    cols = len(glyph[0])
-    points = []
-    for r, row in enumerate(glyph):
-        for c, cell in enumerate(row):
-            if cell == "1":
-                points.append(((c + 0.5) / cols, (r + 0.5) / rows))
-    return points
+def _constellation(count: int) -> list[tuple[float, float]]:
+    """Rings of points around the centre: a tidy cluster, not a shape."""
+    points: list[tuple[float, float]] = []
+    assigned = 0
+    for ring_index, (radius, share) in enumerate(_RINGS):
+        size = count - assigned if ring_index == len(_RINGS) - 1 else max(1, round(count * share))
+        for i in range(size):
+            angle = (2 * math.pi * i / max(1, size)) + ring_index * 0.7
+            points.append(
+                (
+                    0.5 + radius * math.cos(angle),
+                    0.5 + radius * 0.8 * math.sin(angle),
+                )
+            )
+        assigned += size
+        if assigned >= count:
+            break
+    return points[:count]
 
 
 def _jitter(index: int) -> tuple[float, float, int]:
@@ -772,31 +763,17 @@ def _jitter(index: int) -> tuple[float, float, int]:
 
 
 def swarm(assembled: bool) -> None:
-    """Bubble swarm: drifts when idle, settles into R/K when assembled."""
+    """Bubble swarm: drifts when idle, settles into a calm cluster when released."""
     import streamlit as st
 
-    points: list[tuple[float, float]] = []
-    # R sits slightly left of centre, K slightly right.
-    for gx, glyph, width, x0 in (
-        (1, _GLYPH_R, 0.34, 0.18),
-        (2, _GLYPH_K, 0.34, 0.52),
-    ):
-        for px, py in _glyph_points(glyph):
-            points.append((x0 + px * width, 0.14 + py * 0.70))
-
-    # A few strays that never quite join the letters.
-    strays = [(0.08, 0.72), (0.92, 0.30), (0.47, 0.06), (0.72, 0.86), (0.20, 0.10)]
-    points.extend(strays)
-
-    # CSS variables so the swarm re-colours with the theme.
     palette = (
         "var(--rk-accent)",
         "var(--rk-gold)",
-        "color-mix(in srgb, var(--rk-sand-deep) 85%, var(--rk-accent) 15%)",
+        "color-mix(in srgb, var(--rk-sand-deep) 80%, var(--rk-accent) 20%)",
     )
 
     bubbles = []
-    for index, (x, y) in enumerate(points):
+    for index, (x, y) in enumerate(_constellation(31)):
         size = 11 + (index * 7) % 13
         dx, dy, delay = _jitter(index)
         color = palette[index % len(palette)]
@@ -807,9 +784,9 @@ def swarm(assembled: bool) -> None:
 
     state = "is-settled" if assembled else "is-drifting"
     hint = (
-        "R &middot; K &mdash; the swarm found its name."
+        "Settled &mdash; that is what a reproduced bug feels like."
         if assembled
-        else "Click below to release the bug swarm."
+        else "Click to settle the swarm."
     )
     st.markdown(
         f"""

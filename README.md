@@ -116,7 +116,8 @@ reprokit/
 │   ├── magic.py            # Magic Mode: uploads, grounded issues, privacy
 │   ├── patch.py            # strict unified-diff validation + temp staging
 │   ├── verify.py           # approved static checks + report export
-│   └── analysis.py         # AI analysis (Groq by default) + strict parsers
+│   ├── analysis.py         # AI analysis (Groq by default) + strict parsers
+│   └── studio.py           # corrected copies, test recommendations, fix reports
 ├── fixtures/
 │   ├── buggy_app.py        # is_valid_username() with an intentional bug
 │   └── fixed_app.py        # is_valid_input() with the corrected logic
@@ -128,7 +129,9 @@ reprokit/
     ├── test_magic.py       # Magic Mode uploads, grounding, privacy filter
     ├── test_patch.py       # diff validation, path safety, staging
     ├── test_verify.py      # approved checks, tamper/stale/timeout, scope
-    └── test_analysis.py    # AI parsing/safety (no live credentials)
+    ├── test_analysis.py    # AI parsing/safety (no live credentials)
+    ├── test_studio.py      # corrected copies and reports (offline)
+    └── test_app_ui.py      # landing, mode navigation, and review controls
 ```
 
 ## Setup and launch
@@ -273,23 +276,32 @@ The dashboard opens with a **Logic Mode / Magic Mode** switch at the top.
 above: the allowlisted pytest runner, buggy/fixed before-and-after comparison,
 AI log analysis, and bug-report analysis.
 
-**Magic Mode** (Stage 2) is a separate AI-assisted issue-review workflow for
-your own files:
+**Magic Mode** is a universal text-file review workflow for your own files:
 
-- Upload up to 8 code, log, and text files (`.py`, `.ts`, `.log`, `.txt`, `.json`,
-  `.yaml`, …) with a 2 MB per-file / 4 MB total limit.
+- Upload up to 8 source, configuration, log, or text files with the existing
+  2 MB per-file / 4 MB total limit. Supported source extensions include Python,
+  JavaScript/TypeScript, Java, Kotlin, Go, Ruby, Rust, C/C++, C#, PHP, Swift,
+  Scala, Shell, PowerShell, Dart, Lua, Perl, R, Elixir, and Haskell. Supported
+  document/data extensions include JSON, YAML, TOML, XML, HTML, CSS, SCSS, Less,
+  INI, properties, environment files, CSV/TSV, Markdown, plain text, and logs.
+  Unsupported extensions and binary content are rejected with an explicit
+  message rather than decoded and analyzed as source.
 - Files are stored as **read-only snapshots** with a SHA-256 hash; duplicates and
   unsupported extensions are rejected rather than overwritten.
 - **Log files are grouped deterministically** (reusing `reprokit/logs.py`);
-  code and text files are reviewed from a bounded, redacted, line-numbered
-  excerpt sent to the configured Groq model.
+  each source/configuration/text file is independently reviewed from a bounded,
+  redacted, line-numbered excerpt when an AI provider is configured. Without AI,
+  Python AST and JSON/TOML/XML syntax checks still run where supported, and
+  INI, and XML syntax checks still run where supported, and uncertain logic
+  observations are labelled with their assumptions.
 - **Every issue is grounded.** AI-proposed evidence references are resolved
   against the uploaded files; unknown files and out-of-range line numbers are
   discarded, and an issue with no valid evidence is never displayed. The UI shows
   the exact supporting lines (redacted) with `file:line` labels.
 - **AI explanations are hypotheses**, labeled as such and shown separately from
   observed evidence. Severity source (`observed` vs `ai`) is shown per issue.
-- **Follow-up questions** are per issue. Each answer is **Share with AI**,
+- **Follow-up questions are optional** and never block analysis or proposed
+  fixes. Each answer is **Share with AI**,
   **Keep private**, or **Skip**; only explicitly shared, non-empty answers are
   included in later prompts (`MagicSession.shareable_answers()` plus a second
   filter inside `analyze_magic_issues`).
@@ -298,13 +310,17 @@ your own files:
   display: only uploaded code/text files, no absolute paths, `..`, symlinks,
   renames, new/deleted files, binary patches, oversized diffs, or hunks that do
   not apply cleanly to the exact snapshot. Invalid proposals are rejected.
+  A narrow, deterministic whitespace-validation correction is generated when
+  its explicit behavior assumption is shown; other edits require sufficient
+  grounded evidence and a valid AI proposal.
 - Valid proposals are labeled **Proposed — not verified** and shown as a
   canonical diff plus before/after views. Staging (optional) copies all uploads
   into a **fresh temporary workspace** and writes patched files only there;
   original uploads are hash-checked and never modified.
 - **Verify staged proposal** runs only fixed, approved checks: original upload
   hashes, proposal/staged-byte integrity, workspace contents (no missing, extra,
-  or symlinked files), static `.py`/`.json` parsing, and a ReproKit fixture
+  or   symlinked files), static Python/JSON/TOML/INI/XML parsing when available, and
+  a ReproKit fixture
   regression. Results are `verified_static`, `failed`, or `inconclusive` — never
   an unqualified "verified".
 - The fixture check runs **ReproKit's own fixtures** through the allowlisted
@@ -314,6 +330,13 @@ your own files:
 - Every check records its description/command, exit status, duration, bounded
   output, and a UTC timestamp; the report downloads as Markdown. Restaging or
   regenerating a proposal clears previous results.
+- The **Evidence-to-Fix Review Studio** creates downloadable corrected copies
+  (clean or with explanatory comments), can request one Python/pytest regression
+  test recommendation, and exports a Markdown fix report. Generated test code
+  is a proposal only and is never executed; originals are never changed.
+  Corrected-source downloads preserve the uploaded source so the result remains
+  usable; review them for secrets before sharing. In-app source previews and
+  downloadable reports redact detected secrets.
 
 ## Running the tests
 
@@ -323,8 +346,8 @@ From the project root:
 # The full suite (includes the intentionally failing buggy fixture)
 python -m pytest
 
-# The "real" suite that should be green (everything except the intentional bug)
-python -m pytest tests/test_runner.py tests/test_fixed_app.py tests/test_logs.py tests/test_magic.py tests/test_patch.py tests/test_verify.py tests/test_analysis.py
+# The suite that should be green (everything except the intentional bug)
+python -m pytest --ignore=tests/test_buggy_app.py
 
 # Individual suites
 python -m pytest tests/test_buggy_app.py    # EXPECTS 1 failure (the intentional bug)
@@ -335,6 +358,8 @@ python -m pytest tests/test_magic.py        # passes (offline grounding/privacy)
 python -m pytest tests/test_patch.py        # passes (diff validation/staging)
 python -m pytest tests/test_verify.py       # passes (approved checks, no execution)
 python -m pytest tests/test_analysis.py     # passes (no network / no credentials)
+python -m pytest tests/test_studio.py       # passes (corrected copies and reports)
+python -m pytest tests/test_app_ui.py       # passes (Streamlit UI workflow)
 ```
 
 > **Note on the "passing" suite.** `tests/test_buggy_app.py` is written to
@@ -364,8 +389,8 @@ python -m pytest tests/test_analysis.py     # passes (no network / no credential
   user's permissions. There is no container, seccomp, or resource isolation.
 - **No arbitrary uploaded-project testing.** ReproKit runs only its two
   built-in fixtures. It does not accept or execute user-uploaded projects.
-- **No automatic code fixes.** The AI section produces advice only; it never
-  edits files or applies patches.
+- **No automatic changes to originals.** Fixes remain reviewable proposals;
+  corrected downloads and temporary staging workspaces are separate copies.
 - **No live AI without credentials.** Without `GROQ_API_KEY`, the analysis
   section shows an unavailable state and performs no network call.
 - **Provider coupling.** The AI path uses the OpenAI SDK as a client for

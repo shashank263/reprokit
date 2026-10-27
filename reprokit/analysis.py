@@ -625,6 +625,7 @@ Use exactly these keys:
     {
       "title": string,
       "severity": "critical" | "high" | "medium" | "low",
+      "confidence": number between 0 and 1,
       "evidence": [ { "file": string, "line": integer } ],
       "hypothesis": string,
       "questions": array of string
@@ -640,8 +641,10 @@ Rules:
   line number.
 - "hypothesis" is a HYPOTHESIS about the likely cause. Phrase it as such
   (e.g. "Likely caused by ..."). It is not a confirmed fact.
-- "questions" are targeted follow-up questions for the developer, at most 3,
-  used to resolve missing information. Do not ask for secrets.
+- "questions" are optional follow-up questions for the developer, at most 3.
+  Analysis and safe fix generation must not depend on answers. Do not ask for secrets.
+- Analyze each file as a separate unit. Do not infer that multiple uploaded
+  files belong to one application or correlate logs with source without evidence.
 - Do NOT propose patches, diffs, shell commands, or code to execute.
 - If evidence is insufficient for an issue, return fewer issues rather than
   guessing.
@@ -696,6 +699,14 @@ def parse_magic_analysis_json(text: str):
                 f"issue.severity must be one of {list(magic.SEVERITIES)}"
             )
 
+        confidence = item.get("confidence", 0.5)
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0 <= confidence <= 1
+        ):
+            raise MalformedAnalysisError("issue.confidence must be a number from 0 to 1")
+
         raw_evidence = item.get("evidence", [])
         if not isinstance(raw_evidence, list):
             raise MalformedAnalysisError("issue.evidence must be an array")
@@ -728,6 +739,7 @@ def parse_magic_analysis_json(text: str):
                 evidence_refs=refs,
                 hypothesis=hypothesis.strip(),
                 questions=[q.strip() for q in raw_questions if q.strip()],
+                confidence=float(confidence),
             )
         )
 
@@ -998,6 +1010,187 @@ def propose_fix(
         partial = magic.FixProposalDraft(
             explanation="",
             diff="",
+            raw=raw,
+            provider=backend.name,
+            model=backend.model,
+            parse_error=str(exc),
+        )
+        return MagicAnalysisResult(
+            ok=False,
+            data=partial,
+            error=f"Could not parse the AI response: {exc}",
+            status=status,
+        )
+
+    data.provider = backend.name
+    data.model = backend.model
+    return MagicAnalysisResult(ok=True, data=data, error=None, status=status)
+
+
+# ---------------------------------------------------------------------------
+# Magic Mode: regression-test recommendation (Evidence-to-Fix Review Studio)
+# ---------------------------------------------------------------------------
+_REGRESSION_SYSTEM_PROMPT = """\
+You are a careful test engineer recommending ONE regression test for a bug that
+has already been diagnosed. You will be given the issue, its observed evidence
+lines, relevant source excerpts, the proposed fix, and any developer answers
+they explicitly chose to share.
+
+Respond with ONLY a single JSON object. No prose, no markdown, no code fences.
+Use exactly these keys:
+{
+  "feasible": boolean,
+  "language": string,
+  "framework": string,
+  "test_filename": string,
+  "code": string,
+  "scenario": string,
+  "preconditions": array of string,
+  "expected_behavior": string,
+  "why_it_catches": string,
+  "limitations": array of string
+}
+
+Rules:
+- "feasible" is true only when the provided source is enough to write a concrete
+  test. If it is not, set "feasible" to false, leave "code" empty, and explain
+  exactly what is missing in "limitations". Never invent project details, module
+  names, fixtures, or APIs that were not provided.
+- Only generate Python test code (pytest style) with a function named test_*.
+  For any other language set "feasible" to false and explain the limitation.
+- "test_filename" must be a plain filename such as "test_bug_regression.py" -
+  never a path, never one of the uploaded filenames.
+- The test must be self-contained: no network, no file system writes, no shell
+  commands, no time or randomness dependence.
+- "expected_behavior" states the behavior after the fix; "why_it_catches"
+  explains why the test would fail on the buggy version and pass after the fix.
+- You cannot run the test. Never claim it passed. Do not output commands to run.
+- Use only the provided context; never reference files that were not uploaded.
+"""
+
+
+def parse_regression_test_json(text: str):
+    """Parse an AI regression-test recommendation into a studio.RegressionDraft."""
+    from reprokit import studio
+
+    if not text or not text.strip():
+        raise MalformedAnalysisError("response is empty")
+    try:
+        payload = json.loads(_strip_json_fences(text))
+    except json.JSONDecodeError as exc:
+        raise MalformedAnalysisError(f"response is not valid JSON: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise MalformedAnalysisError("JSON root must be an object")
+
+    feasible = payload.get("feasible")
+    if not isinstance(feasible, bool):
+        raise MalformedAnalysisError("feasible must be a boolean")
+
+    def as_text(key: str, required: bool = False) -> str:
+        value = payload.get(key, "")
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            raise MalformedAnalysisError(f"{key} must be a string")
+        if required and not value.strip():
+            raise MalformedAnalysisError(f"{key} must be a non-empty string")
+        return value.strip()
+
+    def as_list(key: str) -> list[str]:
+        value = payload.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise MalformedAnalysisError(f"{key} must be an array of strings")
+        return [v.strip() for v in value if v.strip()]
+
+    limitations = as_list("limitations")
+    if not feasible and not limitations:
+        raise MalformedAnalysisError(
+            "limitations must explain why no test could be generated"
+        )
+
+    filename = as_text("test_filename")
+    if feasible and any(sep in filename for sep in ("/", "\\", "..")):
+        raise MalformedAnalysisError("test_filename must be a plain filename")
+
+    code = payload.get("code", "")
+    if not isinstance(code, str):
+        raise MalformedAnalysisError("code must be a string")
+    if feasible and not code.strip():
+        raise MalformedAnalysisError("code must be non-empty when feasible is true")
+    if not feasible and code.strip():
+        raise MalformedAnalysisError("code must be empty when feasible is false")
+
+    return studio.RegressionDraft(
+        feasible=feasible,
+        language=as_text("language"),
+        framework=as_text("framework"),
+        test_filename=filename,
+        code=code,
+        scenario=as_text("scenario", required=feasible),
+        preconditions=as_list("preconditions"),
+        expected_behavior=as_text("expected_behavior", required=feasible),
+        why_it_catches=as_text("why_it_catches", required=feasible),
+        limitations=limitations,
+        raw=text,
+    )
+
+
+def propose_regression_test(
+    context: str,
+    *,
+    shared_answers: Sequence[object] = (),
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> MagicAnalysisResult:
+    """Ask the provider for a regression-test recommendation.
+
+    Only explicitly shared answers may reach the model. The result is only ever
+    a proposal: nothing is executed.
+    """
+    from reprokit.logs import redact
+
+    name = _resolve_provider_name(provider)
+    provider_cls = _PROVIDERS.get(name)
+    if provider_cls is None:
+        status = _unknown_provider_status(name, model)
+        return MagicAnalysisResult(ok=False, data=None, error=status.reason, status=status)
+
+    backend = provider_cls(model=model)
+    status = backend.status()
+
+    safe_context, _ = redact(context or "")
+    if not safe_context.strip():
+        return MagicAnalysisResult(
+            ok=False, data=None, error="No source context was provided.", status=status
+        )
+    if not status.available:
+        return MagicAnalysisResult(ok=False, data=None, error=status.reason, status=status)
+
+    parts = ["Recommend one regression test using only this context.", safe_context]
+    shared = [
+        a
+        for a in shared_answers
+        if getattr(a, "is_shareable", False) and str(getattr(a, "text", "")).strip()
+    ]
+    if shared:
+        lines = ["=== SHARED DEVELOPER ANSWERS ==="]
+        for answer in shared:
+            safe_text, _ = redact(str(answer.text))
+            lines.append(f"[{getattr(answer, 'question_id', '?')}] {safe_text}")
+        parts.append("\n".join(lines))
+
+    try:
+        raw = backend.analyze_prompt(_REGRESSION_SYSTEM_PROMPT, "\n\n".join(parts))
+    except AIProviderError as exc:
+        return MagicAnalysisResult(ok=False, data=None, error=str(exc), status=status)
+
+    try:
+        data = parse_regression_test_json(raw)
+    except MalformedAnalysisError as exc:
+        from reprokit import studio
+
+        partial = studio.RegressionDraft(
+            feasible=False,
             raw=raw,
             provider=backend.name,
             model=backend.model,

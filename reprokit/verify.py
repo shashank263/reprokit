@@ -18,13 +18,20 @@ An empty selection is rejected rather than treated as success.
 from __future__ import annotations
 
 import ast
+import configparser
 import json
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
 
 from reprokit import patch
 from reprokit.runner import TestRunResult, run_tests
@@ -51,7 +58,7 @@ CHECK_LABELS = {
     CHECK_UPLOADS_UNCHANGED: "Original uploads unchanged",
     CHECK_PROPOSAL_INTEGRITY: "Proposal and staged files match",
     CHECK_WORKSPACE_CONTENTS: "Workspace contents are exactly expected",
-    CHECK_PYTHON_SYNTAX: "Staged source parses (static only)",
+    CHECK_PYTHON_SYNTAX: "Supported formats parse (static only)",
     CHECK_FIXTURE_REGRESSION: "ReproKit fixture regression",
 }
 
@@ -195,7 +202,7 @@ def _validate_check_ids(check_ids: Optional[Sequence[str]]) -> tuple[str, ...]:
 def _validate_timeout(timeout: float) -> float:
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise VerificationInputError(f"timeout must be a positive number, got {timeout!r}")
-    if float(timeout) > max(ALLOWED_TIMEOUTS):
+    if float(timeout) not in ALLOWED_TIMEOUTS:
         raise VerificationInputError(
             f"timeout must be one of {list(ALLOWED_TIMEOUTS)} seconds."
         )
@@ -364,23 +371,38 @@ def _check_workspace_contents(session, base: Path) -> CheckResult:
 
 def _check_python_syntax(base: Path) -> CheckResult:
     started = time.perf_counter()
-    check = "ast.parse .py and json.loads .json (no imports, no execution)"
+    check = "Parse Python, JSON, TOML, INI, and XML where validators are available (no execution)"
     problems: list[str] = []
     checked: list[str] = []
     for path in sorted(base.rglob("*")):
         if not path.is_file() or path.is_symlink():
             continue
         suffix = path.suffix.lower()
-        if suffix not in (".py", ".json"):
+        if suffix not in (".py", ".pyi", ".json", ".toml", ".ini", ".xml"):
+            continue
+        if suffix == ".toml" and tomllib is None:
             continue
         checked.append(path.name)
         text = path.read_text(encoding="utf-8")
         try:
-            if suffix == ".py":
+            if suffix in (".py", ".pyi"):
                 ast.parse(text, filename=path.name)
-            else:
+            elif suffix == ".json":
                 json.loads(text)
-        except (SyntaxError, json.JSONDecodeError) as exc:
+            elif suffix == ".toml":
+                tomllib.loads(text)
+            elif suffix == ".ini":
+                configparser.ConfigParser().read_string(text)
+            else:
+                ET.fromstring(text)
+        except (
+            SyntaxError,
+            json.JSONDecodeError,
+            ValueError,
+            TypeError,
+            ET.ParseError,
+            configparser.Error,
+        ) as exc:
             problems.append(f"{path.name}: {exc}")
     if problems:
         return _make_result(
@@ -390,7 +412,10 @@ def _check_python_syntax(base: Path) -> CheckResult:
     if not checked:
         return _make_result(
             CHECK_PYTHON_SYNTAX, STATUS_INCONCLUSIVE, check=check, started=started,
-            detail="No .py or .json files were staged to parse.",
+            detail=(
+                "No staged files had an available static parser. Supported checks "
+                "here are Python, JSON, TOML (Python 3.11+), INI, and XML."
+            ),
         )
     return _make_result(
         CHECK_PYTHON_SYNTAX, "passed", check=check, started=started,

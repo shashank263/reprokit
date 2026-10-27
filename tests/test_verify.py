@@ -262,8 +262,9 @@ def test_missing_workspace_rejected(staged):
 
 def test_invalid_timeout_rejected(staged):
     session, proposal, _ = staged
-    with pytest.raises(verify.VerificationInputError):
-        verify.verify_proposal(session, proposal, timeout=9999)
+    for timeout in (0, 90, 9999, float("nan"), float("inf")):
+        with pytest.raises(verify.VerificationInputError):
+            verify.verify_proposal(session, proposal, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +389,36 @@ def test_no_parsable_files_is_inconclusive(staged):
     )
     assert report.overall_status == verify.STATUS_VERIFIED  # app.py parses
     # A non-code-only workspace would yield inconclusive; covered by unit intent.
+
+
+def test_static_validator_checks_python_json_toml_and_xml_without_execution(tmp_path):
+    (tmp_path / "source.py").write_text(
+        "raise RuntimeError('not executed')\n", encoding="utf-8"
+    )
+    (tmp_path / "settings.json").write_text('{"enabled": true}\n', encoding="utf-8")
+    (tmp_path / "settings.ini").write_text("[app]\nenabled = true\n", encoding="utf-8")
+    (tmp_path / "settings.xml").write_text("<app />\n", encoding="utf-8")
+    if verify.tomllib is not None:
+        (tmp_path / "settings.toml").write_text("[app]\nenabled = true\n", encoding="utf-8")
+
+    result = verify._check_python_syntax(tmp_path)
+
+    assert result.status == "passed"
+    assert "source.py" in result.output
+    assert "settings.json" in result.output
+    assert "settings.ini" in result.output
+    assert "settings.xml" in result.output
+    if verify.tomllib is not None:
+        assert "settings.toml" in result.output
+
+
+def test_unavailable_static_validator_is_inconclusive(tmp_path):
+    (tmp_path / "source.rs").write_text("fn main() {}", encoding="utf-8")
+
+    result = verify._check_python_syntax(tmp_path)
+
+    assert result.status == verify.STATUS_INCONCLUSIVE
+    assert "No staged files had an available static parser" in result.detail
 
 
 def test_output_is_bounded(staged, monkeypatch):
